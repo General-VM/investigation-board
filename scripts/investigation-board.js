@@ -5,6 +5,7 @@ import { registerSettings } from "./settings.js";
 const MODULE_ID = "investigation-board";
 const BASE_FONT_SIZE = 15;
 const PIN_COLORS = ["redPin.webp", "bluePin.webp", "yellowPin.webp", "greenPin.webp"];
+let positionManager = null;
 
 function getBaseCharacterLimits() {
   return game.settings.get(MODULE_ID, "baseCharacterLimits") || {
@@ -25,6 +26,352 @@ function getDynamicCharacterLimits(noteType, currentFontSize) {
   };
 }
 
+// Position Management System for tracking and syncing note positions and properties
+class NotePositionManager {
+  constructor() {
+    this.positions = {};
+    this.setupHooks();
+    this.setupSockets();
+    this.loadPositions();
+  }
+  
+  setupHooks() {
+    Hooks.on("updateDrawing", this.onNoteUpdate.bind(this));
+    Hooks.on("createDrawing", this.onNoteCreate.bind(this));
+    Hooks.on("deleteDrawing", this.onNoteDelete.bind(this));
+    Hooks.on("canvasReady", this.loadPositions.bind(this));
+  }
+  
+  setupSockets() {
+    if (game.modules.get("socketlib")?.active) {
+      this.socket = socketlib.registerModule(MODULE_ID);
+      this.socket.register("updateNotePosition", this.onExternalPositionUpdate.bind(this));
+      console.log(`${MODULE_ID} | Socket communication initialized for collaborative editing`);
+    } else {
+      console.warn(`${MODULE_ID} | SocketLib not available, collaborative position tracking disabled`);
+    }
+  }
+  
+  // Handle position updates from other users via socket
+  onExternalPositionUpdate(data) {
+    // Update our local positions cache
+    if (data.id && data.position) {
+      this.positions[data.id] = data.position;
+      this.emit("positionsUpdated", this.positions);
+      
+      // Refresh the drawing if it exists on canvas
+      const drawing = canvas.drawings.get(data.id);
+      if (drawing) drawing.refresh();
+    }
+  }
+  
+  // Load saved positions from the current scene
+  async loadPositions() {
+    if (!canvas.scene) return;
+    
+    const savedPositions = canvas.scene.getFlag(MODULE_ID, "notePositions") || {};
+    this.positions = savedPositions;
+    
+    // Update any existing drawings with their saved positions
+    for (const [id, position] of Object.entries(this.positions)) {
+      const drawing = canvas.drawings.get(id);
+      if (drawing) {
+        // Create an update object with all the saved data
+        const updateData = {};
+        
+        // Position and transform properties
+        if (position.x !== undefined && drawing.x !== position.x) updateData.x = position.x;
+        if (position.y !== undefined && drawing.y !== position.y) updateData.y = position.y;
+        if (position.rotation !== undefined && drawing.rotation !== position.rotation) updateData.rotation = position.rotation;
+        if (position.z !== undefined && drawing.z !== position.z) updateData.z = position.z;
+        
+        // Shape properties
+        if (position.width !== undefined && drawing.shape?.width !== position.width) {
+          updateData["shape.width"] = position.width;
+        }
+        if (position.height !== undefined && drawing.shape?.height !== position.height) {
+          updateData["shape.height"] = position.height;
+        }
+        
+        // Scale properties
+        if (position.scaleX !== undefined && drawing.transform?.scaleX !== position.scaleX) {
+          updateData["transform.scaleX"] = position.scaleX;
+        }
+        if (position.scaleY !== undefined && drawing.transform?.scaleY !== position.scaleY) {
+          updateData["transform.scaleY"] = position.scaleY;
+        }
+        
+        // Investigation Board specific properties
+        if (position.type !== undefined && drawing.flags[MODULE_ID]?.type !== position.type) {
+          updateData[`flags.${MODULE_ID}.type`] = position.type;
+        }
+        if (position.text !== undefined && drawing.flags[MODULE_ID]?.text !== position.text) {
+          updateData[`flags.${MODULE_ID}.text`] = position.text;
+        }
+        if (position.image !== undefined && drawing.flags[MODULE_ID]?.image !== position.image) {
+          updateData[`flags.${MODULE_ID}.image`] = position.image;
+        }
+        if (position.pinColor !== undefined && drawing.flags[MODULE_ID]?.pinColor !== position.pinColor) {
+          updateData[`flags.${MODULE_ID}.pinColor`] = position.pinColor;
+        }
+        if (position.identityName !== undefined && drawing.flags[MODULE_ID]?.identityName !== position.identityName) {
+          updateData[`flags.${MODULE_ID}.identityName`] = position.identityName;
+        }
+        
+        // Only perform the update if there are actually changes
+        if (Object.keys(updateData).length > 0) {
+          await drawing.document.update(updateData, { noSocket: true });
+        }
+      }
+    }
+    
+    this.emit("positionsLoaded", this.positions);
+  }
+  
+  onNoteUpdate(document, updateData, options, userId) {
+    // Skip if this is a socket-triggered update to avoid loops
+    if (options.noSocket) return;
+    
+    if (document.flags[MODULE_ID]) {
+      // Check for ANY position or property changes
+      const hasPositionChange = updateData.x !== undefined || 
+                                updateData.y !== undefined ||
+                                updateData.rotation !== undefined ||
+                                updateData.z !== undefined ||
+                                updateData.transform?.scaleX !== undefined ||
+                                updateData.transform?.scaleY !== undefined;
+                                
+      const hasShapeChange = updateData.shape?.width !== undefined || 
+                             updateData.shape?.height !== undefined;
+      
+      // Check for changes to Investigation Board specific properties
+      const hasFlagChanges = updateData.flags?.[MODULE_ID]?.type !== undefined ||
+                             updateData.flags?.[MODULE_ID]?.text !== undefined ||
+                             updateData.flags?.[MODULE_ID]?.image !== undefined ||
+                             updateData.flags?.[MODULE_ID]?.pinColor !== undefined ||
+                             updateData.flags?.[MODULE_ID]?.identityName !== undefined;
+      
+      if (hasPositionChange || hasShapeChange || hasFlagChanges) {
+        this.updatePosition(document, userId);
+      }
+    }
+  }
+  
+  onNoteCreate(document, options, userId) {
+    if (document.flags[MODULE_ID]) {
+      this.updatePosition(document, userId);
+    }
+  }
+  
+  onNoteDelete(document, options, userId) {
+    if (document.flags[MODULE_ID] && this.positions[document.id]) {
+      delete this.positions[document.id];
+      this.savePositions();
+      this.emit("positionsUpdated", this.positions);
+      
+      // Broadcast the deletion
+      if (this.socket && game.user.id === userId) {
+        this.socket.executeForOthers("updateNotePosition", {
+          id: document.id,
+          position: null // null indicates deletion
+        });
+      }
+    }
+  }
+  
+  async updatePosition(document, userId) {
+    // Create a comprehensive position object with ALL note data
+    const position = {
+      // Basic Foundry positioning data
+      id: document.id,
+      x: document.x,
+      y: document.y,
+      rotation: document.rotation || 0,
+      z: document.z || 0,
+      width: document.shape?.width,
+      height: document.shape?.height,
+      scaleX: document.transform?.scaleX || 1,
+      scaleY: document.transform?.scaleY || 1,
+      
+      // Investigation Board specific data
+      type: document.flags[MODULE_ID]?.type || "sticky",
+      text: document.flags[MODULE_ID]?.text || "",
+      image: document.flags[MODULE_ID]?.image || "",
+      pinColor: document.flags[MODULE_ID]?.pinColor || "",
+      identityName: document.flags[MODULE_ID]?.identityName || "",
+      
+      updated: Date.now()
+    };
+    
+    // Update our local cache
+    this.positions[document.id] = position;
+    
+    // Save to scene flags for persistence
+    await this.savePositions();
+    
+    // Trigger any callbacks
+    this.emit("positionsUpdated", this.positions);
+    
+    // Broadcast to other users if this user made the change
+    if (this.socket && game.user.id === userId) {
+      this.socket.executeForOthers("updateNotePosition", {
+        id: document.id,
+        position: position
+      });
+    }
+  }
+  
+  async savePositions() {
+    if (!canvas.scene) return;
+    
+    try {
+      await canvas.scene.setFlag(MODULE_ID, "notePositions", this.positions);
+    } catch (error) {
+      console.error(`${MODULE_ID} | Error saving note positions:`, error);
+    }
+  }
+  
+  getAllPositions() {
+    return this.positions;
+  }
+  
+  getPosition(id) {
+    return this.positions[id] || null;
+  }
+  
+  // Get all notes of a specific type
+  getNotesByType(type) {
+    return Object.values(this.positions).filter(pos => pos.type === type);
+  }
+  
+  // Get all notes with a specific pin color
+  getNotesByPinColor(pinColor) {
+    return Object.values(this.positions).filter(pos => pos.pinColor === pinColor);
+  }
+  
+  // Find notes containing specific text
+  searchNotesByText(searchText) {
+    return Object.values(this.positions).filter(pos => 
+      pos.text && pos.text.toLowerCase().includes(searchText.toLowerCase())
+    );
+  }
+  
+  // Find the nearest note to a specific position
+  findNearestNote(x, y, maxDistance = 100) {
+    let nearest = null;
+    let minDistance = maxDistance;
+    
+    for (const pos of Object.values(this.positions)) {
+      const dx = pos.x - x;
+      const dy = pos.y - y;
+      const distance = Math.sqrt(dx*dx + dy*dy);
+      
+      if (distance < minDistance) {
+        minDistance = distance;
+        nearest = pos;
+      }
+    }
+    
+    return nearest;
+  }
+  
+  // For debugging - log all current positions
+  logPositions() {
+    console.log(`${MODULE_ID} | Current Note Positions:`, this.positions);
+  }
+  
+  // Simple event system
+  callbacks = {};
+  on(event, callback) {
+    if (!this.callbacks[event]) this.callbacks[event] = [];
+    this.callbacks[event].push(callback);
+    return this; // Allow chaining
+  }
+  
+  off(event, callback) {
+    if (this.callbacks[event]) {
+      this.callbacks[event] = this.callbacks[event].filter(cb => cb !== callback);
+    }
+    return this; // Allow chaining
+  }
+  
+  emit(event, data) {
+    if (this.callbacks[event]) {
+      this.callbacks[event].forEach(callback => callback(data));
+    }
+    return this; // Allow chaining
+  }
+}
+
+// Function to show positions dialog for debugging or management
+function showPositionsDialog() {
+  if (!positionManager) return;
+  
+  const positions = positionManager.getAllPositions();
+  
+  let content = `<h2>Investigation Board Notes</h2>
+                <table style="width:100%">
+                  <tr>
+                    <th>ID</th>
+                    <th>Type</th>
+                    <th>Text</th>
+                    <th>Position</th>
+                    <th>Size</th>
+                    <th>Image</th>
+                    <th>Pin</th>
+                  </tr>`;
+  
+  for (const [id, pos] of Object.entries(positions)) {
+    const imagePreview = pos.image ? 
+      `<img src="${pos.image}" width="50" height="50" title="${pos.image}"/>` : 
+      "None";
+    
+    const pinInfo = pos.pinColor ? 
+      `<img src="modules/investigation-board/assets/${pos.pinColor}" width="20" height="20"/>` : 
+      "None";
+    
+    content += `<tr>
+                  <td>${id.substring(0, 8)}...</td>
+                  <td>${pos.type}</td>
+                  <td>${pos.text?.substring(0, 15) || ''}${pos.text?.length > 15 ? '...' : ''}</td>
+                  <td>X:${Math.round(pos.x)}, Y:${Math.round(pos.y)}</td>
+                  <td>${Math.round(pos.width)}×${Math.round(pos.height)}</td>
+                  <td>${imagePreview}</td>
+                  <td>${pinInfo}</td>
+                </tr>`;
+  }
+  
+  content += `</table>`;
+  
+  new Dialog({
+    title: "Investigation Board - Note Positions",
+    content: content,
+    buttons: {
+      close: {
+        icon: '<i class="fas fa-times"></i>',
+        label: "Close"
+      },
+      export: {
+        icon: '<i class="fas fa-file-export"></i>',
+        label: "Export JSON",
+        callback: () => {
+          // Create a download with the positions data
+          const dataStr = JSON.stringify(positions, null, 2);
+          const dataUri = "data:application/json;charset=utf-8," + encodeURIComponent(dataStr);
+          
+          const exportName = `investigation-board-positions-${canvas.scene.name}-${new Date().toISOString().slice(0, 10)}.json`;
+          
+          const linkElement = document.createElement('a');
+          linkElement.setAttribute('href', dataUri);
+          linkElement.setAttribute('download', exportName);
+          linkElement.click();
+        }
+      }
+    },
+    default: "close",
+    width: 500
+  }).render(true);
+}
 
 class CustomDrawingSheet extends DrawingConfig {
   static get defaultOptions() {
@@ -90,8 +437,6 @@ class CustomDrawingSheet extends DrawingConfig {
       }).browse();
     });
   }
-
-
 }
 
 class CustomDrawing extends Drawing {
@@ -285,7 +630,6 @@ class CustomDrawing extends Drawing {
     this.bgSprite.height = height;
     
     // --- Foreground (User-Assigned) Photo for Modern Mode ---
-    // (This is the code missing from your current version.)
     if (isPhoto) {
       const fgImage = noteData.image || "modules/investigation-board/assets/placeholder.webp";
       if (!this.photoImageSprite) {
@@ -328,7 +672,7 @@ class CustomDrawing extends Drawing {
           pinColor = (pinSetting === "random")
             ? PIN_COLORS[Math.floor(Math.random() * PIN_COLORS.length)]
             : `${pinSetting}Pin.webp`;
-	  if (this.document.isOwner) {
+          if (this.document.isOwner) {
             await this.document.update({ [`flags.${MODULE_ID}.pinColor`]: pinColor });
           }
         }
@@ -368,9 +712,6 @@ class CustomDrawing extends Drawing {
     }
     this.noteText.position.set(width / 2, isPhoto ? height - 25 : height / 2);
   }
-  
-  
-  
 
   _truncateText(text, font, noteType, currentFontSize) {
     const limits = getDynamicCharacterLimits(font, currentFontSize);
@@ -378,8 +719,6 @@ class CustomDrawing extends Drawing {
     return text.length <= charLimit ? text : text.slice(0, charLimit).trim() + "...";
   }
 }
-
-
 
 async function createNote(noteType) {
   const scene = canvas.scene;
@@ -441,8 +780,6 @@ async function createNote(noteType) {
   canvas.drawings.activate();
 }
 
-
-
 Hooks.on("getSceneControlButtons", (controls) => {
   const journalControls = controls.find((c) => c.name === "notes");
   if (!journalControls) return;
@@ -450,7 +787,8 @@ Hooks.on("getSceneControlButtons", (controls) => {
   journalControls.tools.push(
     { name: "createStickyNote", title: "Create Sticky Note", icon: "fas fa-sticky-note", onClick: () => createNote("sticky"), button: true },
     { name: "createPhotoNote", title: "Create Photo Note", icon: "fa-solid fa-camera-polaroid", onClick: () => createNote("photo"), button: true },
-    { name: "createIndexCard", title: "Create Index Card", icon: "fa-regular fa-subtitles", onClick: () => createNote("index"), button: true }
+    { name: "createIndexCard", title: "Create Index Card", icon: "fa-regular fa-subtitles", onClick: () => createNote("index"), button: true },
+    { name: "viewNotePositions", title: "View Note Positions", icon: "fas fa-map-marker-alt", onClick: () => showPositionsDialog(), button: true }
   );
 });
 
@@ -467,5 +805,14 @@ Hooks.once("init", () => {
   console.log("Investigation Board module initialized.");
 });
 
+// Initialize position tracking system when Foundry is ready
+Hooks.once("ready", () => {
+  // Initialize the position manager
+  game.InvestigationBoard = game.InvestigationBoard || {};
+  game.InvestigationBoard.positions = new NotePositionManager();
+  positionManager = game.InvestigationBoard.positions;
+  
+  console.log(`${MODULE_ID} | Position tracking system initialized`);
+});
 
 export { CustomDrawing, CustomDrawingSheet };
