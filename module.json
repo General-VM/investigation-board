@@ -25,7 +25,7 @@
   "templates": [
     "templates/drawing-sheet.html"
   ],
-  "url": "https://github.com/mordachai/investigation-board",
+  "url": "https://github.com/General-VM/investigation-board",
   "manifest": "https://github.com/General-VM/investigation-board/raw/main/module.json",
   "download": "https://github.com/General-VM/investigation-board/raw/main/investigation-board.zip"
 }
